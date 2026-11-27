@@ -37,16 +37,13 @@ def zip_bytes():
 
 
 # ---- control bar ----
-c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.4, 3])
-start = c1.select_slider("Show data from year", options=[2005, 2010, 2013, 2016, 2020, 2022], value=2013)
-c2.write("")
-if c2.button("Refresh data now", type="primary", use_container_width=True):
+c2, c3, c4 = st.columns([1.3, 1.5, 4])
+if c2.button("Refresh data now", type="primary"):
     with st.spinner("Fetching all series from their sources..."):
         lines, fails = refresh.run()
     st.session_state["msg"] = (fails, lines)
     st.rerun()
-c3.write("")
-c3.download_button("Download data (zip)", zip_bytes(), "russia_data.zip", "application/zip", use_container_width=True)
+c3.download_button("Download data (zip)", zip_bytes(), "russia_data.zip", "application/zip")
 meta = read_meta()
 c4.markdown(f"**Last successful refresh run (UTC):** {meta.get('_last_run', 'never')}  \n"
             "<span style='font-size:.75rem;color:#5B6578'>This is separate from each chart's latest observation date.</span>",
@@ -64,15 +61,20 @@ def load(k):
     p = D / f"{k}.csv"
     if not p.exists():
         return None
-    df = pd.read_csv(p, parse_dates=["date"])
-    return df[df["date"].dt.year >= start]
+    return pd.read_csv(p, parse_dates=["date"])
+
+
+TXT = "#111827"
 
 
 def style(fig, h=270):
-    fig.update_layout(height=h, paper_bgcolor="white", plot_bgcolor="white", font=dict(color=NAVY, size=11),
-                      margin=dict(l=8, r=8, t=24, b=8), legend=dict(orientation="h", y=1.14, x=0), hovermode="x unified")
-    fig.update_xaxes(gridcolor="#E5E7EB")
-    fig.update_yaxes(gridcolor="#E5E7EB")
+    fig.update_layout(template="plotly_white", height=h, paper_bgcolor="white", plot_bgcolor="white",
+                      font=dict(color=TXT, size=12), margin=dict(l=8, r=8, t=24, b=8), hovermode="x unified",
+                      legend=dict(orientation="h", y=1.14, x=0, font=dict(color=TXT)),
+                      hoverlabel=dict(bgcolor="white", font=dict(color=TXT)))
+    for ax in (fig.update_xaxes, fig.update_yaxes):
+        ax(gridcolor="#E5E7EB", linecolor="#9CA3AF", tickfont=dict(color=TXT), title_font=dict(color=TXT))
+    fig.update_annotations(font=dict(color=TXT))
     return fig
 
 
@@ -111,7 +113,7 @@ def build(k, d):
 def info(k):
     s, m = SERIES[k], meta.get(k, {})
     ref = str(m.get("last_success", "never")).replace("T", " ")[:16]
-    st.caption(f"{s['units']} | {s['freq']} | Source: [{s['source']}]({s['url']})  \n"
+    st.caption(f"{s['units']} | {s['freq']} | Source: [{m.get('source_used') or s['source']}]({s['url']})  \n"
                f"Latest observation: **{m.get('latest_obs', 'n/a')}** | Last successful refresh: **{ref} UTC**  \n"
                f"Transformation: {s['note']}")
     if m.get("status") == "failed":
@@ -126,9 +128,9 @@ def cell(k):
     else:
         fig = style(build(k, d))
         try:
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", theme=None)
         except TypeError:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, theme=None)
     info(k)
 
 

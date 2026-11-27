@@ -20,7 +20,8 @@ def run():
                 raise ValueError("source returned no rows")
             df.to_csv(D / f"{k}.csv", index=False)
             obs = df[~df["forecast"]] if "forecast" in df.columns else df
-            m.update(status="ok", last_success=now, latest_obs=str(obs["date"].max().date()), error=None)
+            m.update(status="ok", last_success=now, latest_obs=str(obs["date"].max().date()), error=None,
+                     source_used=df.attrs.get("source"))
             for c in [c for c in df.columns if c not in ("date", "forecast")]:
                 r = obs.dropna(subset=[c]).iloc[-1]
                 lines.append(f"OK   {k}.{c}: latest {r['date'].date()} = {r[c]}  (source: {s['url']})")
