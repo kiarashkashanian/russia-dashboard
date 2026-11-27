@@ -1,16 +1,16 @@
 """Fetchers + metadata for every series. Each fetcher returns a DataFrame with a 'date' column."""
-import io, re, time, datetime as dt
+import io, os, re, time, datetime as dt
 import xml.etree.ElementTree as ET
 import lxml.html, pandas as pd, requests
 
 H = {"User-Agent": "Mozilla/5.0 (Russia economy dashboard; university assignment)"}
-BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-           "Accept": "application/json,text/plain,*/*", "Accept-Language": "en-US,en;q=0.9",
-           "Referer": "https://www.imf.org/external/datamapper/"}
+CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+BROWSER = {"User-Agent": CHROME, "Accept": "application/json,text/csv,text/plain,*/*", "Accept-Language": "en-US,en;q=0.9"}
+IMF_H = {**BROWSER, "Referer": "https://www.imf.org/external/datamapper/"}
 TODAY = dt.date.today()
 
 
-def _get(url, headers=None, timeout=45, tries=2):
+def _get(url, headers=None, timeout=(10, 60), tries=2):
     err = None
     for _ in range(tries):
         try:
@@ -69,9 +69,20 @@ def fx():
 
 
 def _fred(sid):
-    u = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd=2013-01-01"
-    df = pd.read_csv(io.StringIO(_get(u, timeout=45, tries=3).text))
-    df.columns = ["date", sid]
+    """FRED API if FRED_API_KEY is set, otherwise the public CSV endpoint (browser-style headers; FRED drops bot-like clients)."""
+    df, key = None, os.environ.get("FRED_API_KEY")
+    if key:
+        try:
+            j = _get("https://api.stlouisfed.org/fred/series/observations?series_id=" + sid + "&api_key=" + key
+                     + "&file_type=json&observation_start=2013-01-01", headers=BROWSER).json()
+            df = pd.DataFrame(j["observations"])[["date", "value"]]
+            df.columns = ["date", sid]
+        except Exception:
+            df = None
+    if df is None:
+        u = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd=2013-01-01"
+        df = pd.read_csv(io.StringIO(_get(u, headers=BROWSER, tries=3).text))
+        df.columns = ["date", sid]
     df["date"] = pd.to_datetime(df["date"])
     df[sid] = pd.to_numeric(df[sid], errors="coerce")
     return df.dropna()
@@ -82,35 +93,66 @@ def oil_gas():
     return d.rename(columns={"DCOILBRENTEU": "brent", "PNGASEUUSDM": "gas"})
 
 
+_S, _warm = requests.Session(), []
+
+
+def _imf_get(url):
+    """The IMF blocks bot-like first requests: reuse one session, warm it up, retry with backoff."""
+    if not _warm:
+        _warm.append(1)
+        try:
+            _S.get("https://www.imf.org/external/datamapper/", headers=IMF_H, timeout=20)
+        except requests.RequestException:
+            pass
+    err = None
+    for wait in (0, 3, 8):
+        time.sleep(wait)
+        try:
+            r = _S.get(url, headers=IMF_H, timeout=(10, 90))
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            err = e
+    raise err
+
+
 def _imf(code):
-    d = _get(f"https://www.imf.org/external/datamapper/api/v1/{code}/RUS", headers=BROWSER).json()["values"][code]["RUS"]
+    d = _imf_get(f"https://www.imf.org/external/datamapper/api/v1/{code}/RUS").json()["values"][code]["RUS"]
     df = pd.DataFrame({"date": pd.to_datetime([f"{y}-12-31" for y in d]), "value": list(d.values())})
     df = df[df["date"].dt.year >= 2005].sort_values("date")
     df["forecast"] = df["date"].dt.year >= TODAY.year  # IMF estimates/projections
     return df
 
 
-def _wb(indicator):
-    j = _get(f"https://api.worldbank.org/v2/country/RUS/indicator/{indicator}?format=json&per_page=200").json()
-    rows = [(pd.Timestamp(f"{r['date']}-12-31"), r["value"]) for r in j[1] if r["value"] is not None and int(r["date"]) >= 2005]
-    if not rows:
-        raise ValueError(f"World Bank returned no data for {indicator}")
-    df = pd.DataFrame(rows, columns=["date", "value"]).sort_values("date")
-    df["forecast"] = False
-    return df
+def _wb(indicators):
+    errs = []
+    for ind in indicators:
+        try:
+            j = _get(f"https://api.worldbank.org/v2/country/RUS/indicator/{ind}?format=json&per_page=200", headers=BROWSER).json()
+            rows = [(pd.Timestamp(f"{r['date']}-12-31"), r["value"]) for r in (j[1] if len(j) > 1 and j[1] else [])
+                    if r["value"] is not None and int(r["date"]) >= 2005]
+            if rows:
+                df = pd.DataFrame(rows, columns=["date", "value"]).sort_values("date")
+                df["forecast"] = False
+                return df
+            errs.append(f"{ind}: no data ({str(j[0])[:80]})")
+        except Exception as e:
+            errs.append(f"{ind}: {type(e).__name__}")
+    raise ValueError("World Bank fallback failed: " + "; ".join(errs))
 
 
-WB_FALLBACK = {"GGXCNL_NGDP": "GC.BAL.CASH.GD.ZS", "NGDP_RPCH": "NY.GDP.MKTP.KD.ZG", "LUR": "SL.UEM.TOTL.ZS"}
+WB_FALLBACK = {"GGXCNL_NGDP": ["GC.BAL.CASH.GD.ZS", "GC.NLD.TOTL.GD.ZS"], "NGDP_RPCH": ["NY.GDP.MKTP.KD.ZG"], "LUR": ["SL.UEM.TOTL.ZS"]}
 
 
 def annual(code):
     """IMF DataMapper first; if the IMF blocks the request, fall back to the World Bank API."""
     try:
-        df = _imf(code)
-        src = "IMF DataMapper (WEO)"
+        df, src = _imf(code), "IMF DataMapper (WEO)"
     except Exception as e:
-        df = _wb(WB_FALLBACK[code])
-        src = f"World Bank WDI (IMF unavailable: {type(e).__name__})"
+        try:
+            df, src = _wb(WB_FALLBACK[code]), f"World Bank WDI (IMF unavailable: {type(e).__name__})"
+        except Exception as e2:
+            raise RuntimeError(f"IMF: {type(e).__name__}: {e} | {e2}")
     df.attrs["source"] = src
     return df
 

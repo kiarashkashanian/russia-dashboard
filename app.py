@@ -9,7 +9,7 @@ D = pathlib.Path(__file__).parent / "data"
 st.set_page_config(page_title="Russia Economic Monitor", page_icon="📊", layout="wide")
 
 st.markdown("""<style>
-.block-container{padding-top:.6rem;padding-bottom:1rem;max-width:1500px}
+.block-container{padding-top:3.5rem;padding-bottom:1rem;max-width:1500px}
 .stripe{height:6px;background:linear-gradient(#fff 33.3%,#0039A6 33.3% 66.6%,#D52B1E 66.6%);border:1px solid #D5DAE3;margin-bottom:12px}
 .flag{width:54px;height:36px;border:1px solid #C5CBD6;background:linear-gradient(#fff 33.3%,#0039A6 33.3% 66.6%,#D52B1E 66.6%)}
 .ttl{font-size:1.6rem;font-weight:700;line-height:1.2;color:#12274D} .sub{color:#5B6578;font-size:.9rem}
