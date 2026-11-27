@@ -117,6 +117,17 @@ def _yahoo(sym):
     raise err
 
 
+def _eia_brent():
+    """U.S. EIA's own daily Brent spot file (primary source behind the FRED series). Needs xlrd to read .xls."""
+    r = _get("https://www.eia.gov/dnav/pet/hist_xls/RBRTEd.xls", headers=BROWSER, timeout=(10, 60), tries=2)
+    df = pd.read_excel(io.BytesIO(r.content), sheet_name="Data 1", skiprows=2).iloc[:, :2]
+    df.columns = ["date", "v"]
+    df["date"] = pd.to_datetime(df["date"])
+    df["v"] = pd.to_numeric(df["v"], errors="coerce")
+    df = df.dropna()
+    return df[df["date"] >= "2013-01-01"]
+
+
 def _ttf_usd_mmbtu():
     """Dutch TTF front-month (EUR/MWh) -> USD/MMBtu, using official CBR rates for EUR/USD (1 MWh = 3.412 MMBtu)."""
     ttf = _yahoo("TTF=F").rename(columns={"v": "ttf"})
@@ -131,7 +142,8 @@ def _ttf_usd_mmbtu():
 def oil_gas():
     """Brent and EU gas, each from the first source that answers; a missing series falls back to the cached CSV."""
     parts, srcs, errs = {}, {}, []
-    chains = {"brent": [("FRED/EIA", lambda: _try_fred("DCOILBRENTEU")), ("Yahoo Finance BZ=F", lambda: _yahoo("BZ=F"))],
+    chains = {"brent": [("FRED/EIA", lambda: _try_fred("DCOILBRENTEU")), ("EIA direct file", _eia_brent),
+                        ("Yahoo Finance BZ=F", lambda: _yahoo("BZ=F"))],
               "gas": [("FRED/IMF", lambda: _try_fred("PNGASEUUSDM")), ("Yahoo Finance TTF=F converted to USD/MMBtu", _ttf_usd_mmbtu)]}
     for col, chain in chains.items():
         for name, fn in chain:
@@ -149,12 +161,16 @@ def oil_gas():
         old = pd.read_csv(p, parse_dates=["date"])
     for col in chains:
         if col not in parts:
-            if old is None or col not in old or old[col].dropna().empty:
-                raise RuntimeError("all sources failed: " + "; ".join(errs))
-            parts[col], srcs[col] = old[["date", col]].dropna(), "cached copy (live sources failed)"
+            if old is not None and col in old and not old[col].dropna().empty:
+                parts[col], srcs[col] = old[["date", col]].dropna(), "cached copy (live sources failed)"
+            else:  # chart still draws the other series
+                parts[col] = pd.DataFrame({"date": pd.Series([], dtype="datetime64[ns]"), col: pd.Series([], dtype=float)})
+                srcs[col] = "unavailable"
+    if all(v == "unavailable" for v in srcs.values()):
+        raise RuntimeError("all sources failed: " + "; ".join(errs))
     df = parts["brent"].merge(parts["gas"], on="date", how="outer").sort_values("date")
     df.attrs["source"] = f"Brent: {srcs['brent']}; EU gas: {srcs['gas']}"
-    if any("cached" in v for v in srcs.values()):
+    if any(v.startswith(("cached", "unavailable")) for v in srcs.values()):
         df.attrs["warning"] = "; ".join(errs)[:300]
     return df
 
