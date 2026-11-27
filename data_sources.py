@@ -1,5 +1,5 @@
 """Fetchers + metadata for every series. Each fetcher returns a DataFrame with a 'date' column."""
-import io, os, re, time, datetime as dt
+import io, os, re, time, pathlib, datetime as dt
 import xml.etree.ElementTree as ET
 import lxml.html, pandas as pd, requests
 
@@ -81,16 +81,82 @@ def _fred(sid):
             df = None
     if df is None:
         u = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd=2013-01-01"
-        df = pd.read_csv(io.StringIO(_get(u, headers=BROWSER, tries=3).text))
+        df = pd.read_csv(io.StringIO(_get(u, headers=BROWSER, timeout=(8, 25), tries=1).text))
         df.columns = ["date", sid]
     df["date"] = pd.to_datetime(df["date"])
     df[sid] = pd.to_numeric(df[sid], errors="coerce")
     return df.dropna()
 
 
+_fred_down = []
+
+
+def _try_fred(sid):
+    if _fred_down:  # FRED stalled once already this run: don't wait for it again
+        raise RuntimeError("FRED skipped after earlier timeout")
+    try:
+        return _fred(sid)
+    except Exception:
+        _fred_down.append(1)
+        raise
+
+
+def _yahoo(sym):
+    """Daily closes from Yahoo Finance's chart API (no key). Secondary vendor, used only when the primary feed is unreachable."""
+    p1 = int(dt.datetime(2013, 1, 1, tzinfo=dt.timezone.utc).timestamp())
+    err = None
+    for host in ("query1", "query2"):
+        try:
+            j = _get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{sym}?period1={p1}&period2={int(time.time())}&interval=1d",
+                     headers=BROWSER, timeout=(8, 30), tries=2).json()
+            r = j["chart"]["result"][0]
+            df = pd.DataFrame({"date": pd.to_datetime(r["timestamp"], unit="s").normalize().astype("datetime64[ns]"), "v": r["indicators"]["quote"][0]["close"]})
+            return df.dropna().drop_duplicates("date", keep="last")
+        except Exception as e:
+            err = e
+    raise err
+
+
+def _ttf_usd_mmbtu():
+    """Dutch TTF front-month (EUR/MWh) -> USD/MMBtu, using official CBR rates for EUR/USD (1 MWh = 3.412 MMBtu)."""
+    ttf = _yahoo("TTF=F").rename(columns={"v": "ttf"})
+    eur, usd = _fx("R01239").rename(columns={"R01239": "eur"}), _fx("R01235").rename(columns={"R01235": "usd"})
+    fx_ = eur.merge(usd, on="date").assign(eurusd=lambda d: d["eur"] / d["usd"])
+    fx_["date"] = fx_["date"].astype("datetime64[ns]")
+    m = pd.merge_asof(ttf.sort_values("date"), fx_[["date", "eurusd"]].sort_values("date"), on="date")
+    m["v"] = m["ttf"] * m["eurusd"] / 3.412
+    return m[["date", "v"]].dropna()
+
+
 def oil_gas():
-    d = _fred("DCOILBRENTEU").merge(_fred("PNGASEUUSDM"), on="date", how="outer").sort_values("date")
-    return d.rename(columns={"DCOILBRENTEU": "brent", "PNGASEUUSDM": "gas"})
+    """Brent and EU gas, each from the first source that answers; a missing series falls back to the cached CSV."""
+    parts, srcs, errs = {}, {}, []
+    chains = {"brent": [("FRED/EIA", lambda: _try_fred("DCOILBRENTEU")), ("Yahoo Finance BZ=F", lambda: _yahoo("BZ=F"))],
+              "gas": [("FRED/IMF", lambda: _try_fred("PNGASEUUSDM")), ("Yahoo Finance TTF=F converted to USD/MMBtu", _ttf_usd_mmbtu)]}
+    for col, chain in chains.items():
+        for name, fn in chain:
+            try:
+                d = fn()
+                d.columns = ["date", col]
+                d["date"] = pd.to_datetime(d["date"]).astype("datetime64[ns]")
+                parts[col], srcs[col] = d, name
+                break
+            except Exception as e:
+                errs.append(f"{col} via {name}: {type(e).__name__}")
+    old = None
+    p = pathlib.Path(__file__).parent / "data" / "oil_gas.csv"
+    if p.exists():
+        old = pd.read_csv(p, parse_dates=["date"])
+    for col in chains:
+        if col not in parts:
+            if old is None or col not in old or old[col].dropna().empty:
+                raise RuntimeError("all sources failed: " + "; ".join(errs))
+            parts[col], srcs[col] = old[["date", col]].dropna(), "cached copy (live sources failed)"
+    df = parts["brent"].merge(parts["gas"], on="date", how="outer").sort_values("date")
+    df.attrs["source"] = f"Brent: {srcs['brent']}; EU gas: {srcs['gas']}"
+    if any("cached" in v for v in srcs.values()):
+        df.attrs["warning"] = "; ".join(errs)[:300]
+    return df
 
 
 _S, _warm = requests.Session(), []
@@ -102,6 +168,7 @@ def _imf_get(url):
         _warm.append(1)
         try:
             _S.get("https://www.imf.org/external/datamapper/", headers=IMF_H, timeout=20)
+            _S.get("https://www.imf.org/external/datamapper/api/v1/NGDP_RPCH/RUS", headers=IMF_H, timeout=(10, 90))  # small request that gets through
         except requests.RequestException:
             pass
     err = None
@@ -154,6 +221,8 @@ def annual(code):
         except Exception as e2:
             raise RuntimeError(f"IMF: {type(e).__name__}: {e} | {e2}")
     df.attrs["source"] = src
+    if src.startswith("World Bank"):
+        df.attrs["warning"] = "IMF blocked the request; World Bank figures shown, definitions can differ from the IMF series"
     return df
 
 
@@ -164,9 +233,9 @@ SERIES = {
         source="Bank of Russia (Rosstat data)", url="https://www.cbr.ru/hd_base/infl/", note="None; y/y rate as published. Dashed line = 4% CBR target."),
     "fx": dict(fn=fx, title="Ruble exchange rates", units="RUB per 1 USD / per 1 CNY (higher = weaker ruble)", freq="Daily (official CBR rate)",
         source="Bank of Russia", url="https://www.cbr.ru/currency_base/dynamics/", note="CBR quotes CNY per 10 units; divided by the Nominal field to give RUB per 1 CNY."),
-    "oil_gas": dict(fn=oil_gas, title="Oil and gas prices", units="Brent: USD per barrel (left). EU gas: USD per MMBtu (right)", freq="Brent daily; EU gas monthly",
-        source="FRED: U.S. EIA (Brent), IMF (EU gas)", url="https://fred.stlouisfed.org/series/DCOILBRENTEU",
-        note="None. Brent is a proxy: Urals sells at a discount and has no free API. Gas is monthly and lags."),
+    "oil_gas": dict(fn=oil_gas, title="Oil and gas prices", units="Brent: USD per barrel (left). EU gas: USD per MMBtu (right)", freq="Brent daily; EU gas monthly (FRED) or daily (fallback)",
+        source="FRED (U.S. EIA Brent, IMF EU gas); fallback Yahoo Finance", url="https://fred.stlouisfed.org/series/DCOILBRENTEU",
+        note="Fallback gas: Dutch TTF EUR/MWh converted to USD/MMBtu with CBR EUR/USD rates. Brent is a proxy: Urals sells at a discount and has no free API."),
     "balance": dict(fn=lambda: annual("GGXCNL_NGDP"), title="Budget balance", units="% of GDP (negative = deficit)", freq="Annual",
         source="IMF DataMapper (World Bank fallback)", url="https://www.imf.org/external/datamapper/GGXCNL_NGDP@WEO/RUS",
         note="IMF: general government balance. World Bank fallback: central government cash balance. Faded bars = IMF estimate/projection."),

@@ -116,8 +116,8 @@ def info(k):
     st.caption(f"{s['units']} | {s['freq']} | Source: [{m.get('source_used') or s['source']}]({s['url']})  \n"
                f"Latest observation: **{m.get('latest_obs', 'n/a')}** | Last successful refresh: **{ref} UTC**  \n"
                f"Transformation: {s['note']}")
-    if m.get("status") == "failed":
-        st.warning(f"Last refresh failed ({m.get('error')}). Showing cached data.")
+    if m.get("status") in ("failed", "partial"):
+        st.warning(f"Refresh issue: {m.get('error')}")
 
 
 def cell(k):

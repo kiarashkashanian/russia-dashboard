@@ -20,11 +20,12 @@ def run():
                 raise ValueError("source returned no rows")
             df.to_csv(D / f"{k}.csv", index=False)
             obs = df[~df["forecast"]] if "forecast" in df.columns else df
-            m.update(status="ok", last_success=now, latest_obs=str(obs["date"].max().date()), error=None,
+            warn = df.attrs.get("warning")
+            m.update(status="partial" if warn else "ok", last_success=now, latest_obs=str(obs["date"].max().date()), error=warn,
                      source_used=df.attrs.get("source"))
             for c in [c for c in df.columns if c not in ("date", "forecast")]:
                 r = obs.dropna(subset=[c]).iloc[-1]
-                lines.append(f"OK   {k}.{c}: latest {r['date'].date()} = {r[c]}  (source: {s['url']})")
+                lines.append(f"{'WARN' if warn else 'OK  '} {k}.{c}: latest {r['date'].date()} = {r[c]}  (source: {df.attrs.get('source') or s['url']})" + (f" | {warn}" if warn else ""))
         except Exception as e:
             fails += 1
             m.update(status="failed", error=f"{type(e).__name__}: {e}"[:300])
